@@ -3483,8 +3483,12 @@ struct NemotronASRTests {
             return
         }
         let chunkMs = Int(env["MLXAUDIO_STREAM_CHUNK_MS"] ?? "") ?? 80
+        // The python mlx-audio reference computes in float32; the SDK default is
+        // bfloat16. MLXAUDIO_COMPUTE_DTYPE=float32 aligns the smoke for parity runs.
+        let computeDType: DType = env["MLXAUDIO_COMPUTE_DTYPE"] == "float32" ? .float32 : .bfloat16
 
-        let model = try NemotronASRModel.fromDirectory(URL(fileURLWithPath: dirPath, isDirectory: true))
+        let model = try NemotronASRModel.fromDirectory(
+            URL(fileURLWithPath: dirPath, isDirectory: true), computeDType: computeDType)
         let (sampleRate, audio) = try loadAudioArray(
             from: URL(fileURLWithPath: wavPath), sampleRate: 16000)
         #expect(sampleRate == 16000)
