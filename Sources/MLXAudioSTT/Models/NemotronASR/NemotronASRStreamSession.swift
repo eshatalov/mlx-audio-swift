@@ -96,6 +96,11 @@ public final class NemotronASRStreamSession {
     public struct Delta {
         public let text: String
         public let tokenIds: [Int]
+        /// Newly emitted aligned tokens for this call, in emission order. `start` is
+        /// the greedy RNN-T emission frame × frame duration (80 ms on the shipped
+        /// checkpoint) from the beginning of the session's audio; `duration` is one
+        /// frame. These are token *emission* times, not word alignments.
+        public let tokens: [NemoAlignedToken]
     }
 
     private let model: NemotronASRModel
@@ -161,10 +166,10 @@ public final class NemotronASRStreamSession {
     }
 
     private func advance(final: Bool) -> Delta {
-        guard !done else { return Delta(text: "", tokenIds: []) }
+        guard !done else { return Delta(text: "", tokenIds: [], tokens: []) }
         guard !rawBuffer.isEmpty else {
             if final { done = true }
-            return Delta(text: "", tokenIds: [])
+            return Delta(text: "", tokenIds: [], tokens: [])
         }
 
         let audio = MLXArray(rawBuffer)
@@ -199,11 +204,11 @@ public final class NemotronASRStreamSession {
             ? String(fullText.dropFirst(emittedText.count))
             : fullText
         emittedText = fullText
-        let deltaIds = rnntState.results[firstNew...].map { $0.id }
+        let newTokens = Array(rnntState.results[firstNew...])
 
         if final { done = true }
         Memory.clearCache()
-        return Delta(text: deltaText, tokenIds: Array(deltaIds))
+        return Delta(text: deltaText, tokenIds: newTokens.map { $0.id }, tokens: newTokens)
     }
 
     /// Number of mel frames whose STFT window is fully covered by real audio, hence

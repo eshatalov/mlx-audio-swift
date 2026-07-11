@@ -3417,6 +3417,113 @@ struct NemotronASRTests {
         let (coarse, _) = sessionText(model, audio, feed: 1500)
         #expect(fine == coarse)
     }
+
+    /// Delta.tokens must carry every emitted token exactly once, in emission order,
+    /// with monotonically non-decreasing frame-grid timestamps — the timing surface a
+    /// pause-based segmenter consumes.
+    @Test func streamSessionDeltaTokensCarryTimings() throws {
+        guard mlxRuntimeEnabled else {
+            print("Skipping Nemotron ASR MLX runtime test. Set MLXAUDIO_ENABLE_MLX_RUNTIME_TESTS=1 to enable.")
+            return
+        }
+        let samples = syntheticAudio(samples: 6000).asArray(Float.self)
+
+        // A random tiny model occasionally emits no non-blank tokens at all, and
+        // parallel tests share the global RNG, so a fixed seed alone is not
+        // deterministic — retry a few instances until one emits.
+        var collected: [NemoAlignedToken] = []
+        var frameSeconds = 0.0
+        for _ in 0..<8 where collected.isEmpty {
+            let model = try tinyModel()
+            let session = model.makeStreamSession(language: "en-US")
+            var got: [NemoAlignedToken] = []
+            var i = 0
+            while i < samples.count {
+                let e = min(i + 200, samples.count)
+                let delta = session.step(Array(samples[i..<e]))
+                #expect(delta.tokens.map { $0.id } == delta.tokenIds)
+                got.append(contentsOf: delta.tokens)
+                i = e
+            }
+            let final = session.finish()
+            #expect(final.tokens.map { $0.id } == final.tokenIds)
+            got.append(contentsOf: final.tokens)
+
+            // Union of per-call deltas == cumulative session state, order preserved.
+            #expect(got.map { $0.id } == session.tokens)
+            collected = got
+            frameSeconds = Double(model.encoderConfig.subsamplingFactor * model.preprocessConfig.hopLength)
+                / Double(model.preprocessConfig.sampleRate)
+        }
+        #expect(collected.isEmpty == false)
+        for (a, b) in zip(collected, collected.dropFirst()) {
+            #expect(a.start <= b.start)
+        }
+        for token in collected {
+            #expect(token.duration == frameSeconds)
+            // Timestamps sit on the encoder frame grid.
+            let frames = token.start / frameSeconds
+            #expect(abs(frames - frames.rounded()) < 1e-6)
+        }
+    }
+
+    /// Real-weights streaming smoke over a local pinned checkpoint. No-op unless
+    /// MLXAUDIO_NEMOTRON_DIR points at a model directory. Optional:
+    /// MLXAUDIO_STREAM_WAV (input clip), MLXAUDIO_STREAM_CHUNK_MS (default 80),
+    /// MLXAUDIO_STREAM_DUMP (writes {text, tokens:[{id,text,start,duration}]} JSON
+    /// for offline comparison against the python mlx-audio reference).
+    @Test func nemotronRealWeightsStreamSmoke() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let dirPath = env["MLXAUDIO_NEMOTRON_DIR"], !dirPath.isEmpty else {
+            print("Skipping Nemotron real-weights smoke. Set MLXAUDIO_NEMOTRON_DIR=<path> to enable.")
+            return
+        }
+        guard let wavPath = env["MLXAUDIO_STREAM_WAV"], !wavPath.isEmpty else {
+            print("Skipping Nemotron real-weights smoke. Set MLXAUDIO_STREAM_WAV=<clip.wav> to enable.")
+            return
+        }
+        let chunkMs = Int(env["MLXAUDIO_STREAM_CHUNK_MS"] ?? "") ?? 80
+
+        let model = try NemotronASRModel.fromDirectory(URL(fileURLWithPath: dirPath, isDirectory: true))
+        let (sampleRate, audio) = try loadAudioArray(
+            from: URL(fileURLWithPath: wavPath), sampleRate: 16000)
+        #expect(sampleRate == 16000)
+
+        let samples = (audio.ndim > 1 ? audio.mean(axis: -1) : audio)
+            .asType(.float32).asArray(Float.self)
+        let chunk = max(1, 16000 * chunkMs / 1000)
+        let session = model.makeStreamSession(chunkMs: chunkMs)
+
+        var collected: [NemoAlignedToken] = []
+        var i = 0
+        while i < samples.count {
+            let e = min(i + chunk, samples.count)
+            collected.append(contentsOf: session.step(Array(samples[i..<e])).tokens)
+            i = e
+        }
+        collected.append(contentsOf: session.finish().tokens)
+
+        #expect(collected.isEmpty == false)
+        #expect(collected.map { $0.id } == session.tokens)
+        for (a, b) in zip(collected, collected.dropFirst()) {
+            #expect(a.start <= b.start)
+        }
+        print("nemotron stream smoke: \(collected.count) tokens, text: \(session.text)")
+
+        if let dumpPath = env["MLXAUDIO_STREAM_DUMP"], !dumpPath.isEmpty {
+            let payload: [String: Any] = [
+                "chunk_ms": chunkMs,
+                "text": session.text,
+                "tokens": collected.map {
+                    ["id": $0.id, "text": $0.text, "start": $0.start, "duration": $0.duration]
+                },
+            ]
+            let data = try JSONSerialization.data(
+                withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
+            try data.write(to: URL(fileURLWithPath: dumpPath))
+            print("nemotron stream smoke: dump written to \(dumpPath)")
+        }
+    }
 }
 
 struct VoxtralRealtimeSTTTests {
