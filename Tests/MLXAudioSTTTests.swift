@@ -3376,9 +3376,11 @@ struct NemotronASRTests {
         return text
     }
 
-    private func sessionText(_ model: NemotronASRModel, _ audio: MLXArray, feed: Int) -> (String, [Int]) {
-        let samples = audio.asArray(Float.self)
-        let session = model.makeStreamSession(language: "en-US")
+    private func finishSession(
+        _ session: NemotronASRStreamSession,
+        samples: [Float],
+        feed: Int
+    ) -> (String, [Int]) {
         var i = 0
         while i < samples.count {
             let e = min(i + feed, samples.count)
@@ -3387,6 +3389,14 @@ struct NemotronASRTests {
         }
         _ = session.finish()
         return (session.text, session.tokens)
+    }
+
+    private func sessionText(_ model: NemotronASRModel, _ audio: MLXArray, feed: Int) -> (String, [Int]) {
+        finishSession(
+            model.makeStreamSession(language: "en-US"),
+            samples: audio.asArray(Float.self),
+            feed: feed
+        )
     }
 
     /// The incremental session, fed in small chunks, must reproduce the one-shot
@@ -3461,16 +3471,110 @@ struct NemotronASRTests {
         }
         for token in collected {
             #expect(token.duration == frameSeconds)
+            #expect(token.logprob.isFinite)
+            #expect(token.logprob <= 1e-4)
+            #expect(token.entropy.isFinite)
+            #expect(token.entropy >= -1e-6)
             // Timestamps sit on the encoder frame grid.
             let frames = token.start / frameSeconds
             #expect(abs(frames - frames.rounded()) < 1e-6)
         }
     }
 
+    @Test func offlineDecodeTokensCarryEmissionStatistics() throws {
+        guard mlxRuntimeEnabled else {
+            print("Skipping Nemotron ASR MLX runtime test. Set MLXAUDIO_ENABLE_MLX_RUNTIME_TESTS=1 to enable.")
+            return
+        }
+        let values = moduloFloatFixtureValues(
+            count: 48 * 16, multiplier: 7, modulus: 23, divisor: 23.0)
+        let mel = MLXArray(values).reshaped([1, 48, 16])
+        var tokens: [NemoAlignedToken] = []
+        for _ in 0..<8 where tokens.isEmpty {
+            let model = try tinyModel()
+            let result = model.decode(mel: mel, language: "auto", attContextSize: [4, 1])
+            tokens = result.sentences.flatMap(\.tokens)
+        }
+        #expect(tokens.isEmpty == false)
+        for token in tokens {
+            #expect(token.logprob.isFinite)
+            #expect(token.logprob <= 1e-4)
+            #expect(token.entropy.isFinite)
+            #expect(token.entropy >= -1e-6)
+        }
+    }
+
+    @Test func streamSessionSetSameLanguageIsInvariant() throws {
+        guard mlxRuntimeEnabled else {
+            print("Skipping Nemotron ASR MLX runtime test. Set MLXAUDIO_ENABLE_MLX_RUNTIME_TESTS=1 to enable.")
+            return
+        }
+        let model = try tinyModel()
+        let samples = syntheticAudio(samples: 6000).asArray(Float.self)
+        let split = samples.count / 2
+
+        func run(callSetLanguage: Bool) -> (String, [Int]) {
+            let session = model.makeStreamSession(language: "en-US", chunkMs: 80)
+            _ = session.step(Array(samples[..<split]))
+            if callSetLanguage { session.setLanguage("en-US") }
+            _ = session.step(Array(samples[split...]))
+            _ = session.finish()
+            return (session.text, session.tokens)
+        }
+
+        let baseline = run(callSetLanguage: false)
+        let changed = run(callSetLanguage: true)
+        #expect(changed.0 == baseline.0)
+        #expect(changed.1 == baseline.1)
+    }
+
+    @Test func streamSessionSetLanguageBeforeFirstStepMatchesInitialLanguage() throws {
+        guard mlxRuntimeEnabled else {
+            print("Skipping Nemotron ASR MLX runtime test. Set MLXAUDIO_ENABLE_MLX_RUNTIME_TESTS=1 to enable.")
+            return
+        }
+        let model = try tinyModel()
+        let samples = syntheticAudio(samples: 6000).asArray(Float.self)
+
+        let initialEn = finishSession(
+            model.makeStreamSession(language: "en-US", chunkMs: 80),
+            samples: samples, feed: 200)
+        let setEnSession = model.makeStreamSession(language: nil, chunkMs: 80)
+        setEnSession.setLanguage("en-US")
+        let setEn = finishSession(setEnSession, samples: samples, feed: 200)
+        #expect(setEn.0 == initialEn.0)
+        #expect(setEn.1 == initialEn.1)
+
+        let initialAuto = finishSession(
+            model.makeStreamSession(language: nil, chunkMs: 80),
+            samples: samples, feed: 200)
+        let setAutoSession = model.makeStreamSession(language: "en-US", chunkMs: 80)
+        setAutoSession.setLanguage(nil)
+        let setAuto = finishSession(setAutoSession, samples: samples, feed: 200)
+        #expect(setAuto.0 == initialAuto.0)
+        #expect(setAuto.1 == initialAuto.1)
+    }
+
+    @Test func streamSessionLanguageSwitchFinishes() throws {
+        guard mlxRuntimeEnabled else {
+            print("Skipping Nemotron ASR MLX runtime test. Set MLXAUDIO_ENABLE_MLX_RUNTIME_TESTS=1 to enable.")
+            return
+        }
+        let model = try tinyModel()
+        let samples = syntheticAudio(samples: 6000).asArray(Float.self)
+        let split = samples.count / 2
+        let session = model.makeStreamSession(language: nil, chunkMs: 80)
+        _ = session.step(Array(samples[..<split]))
+        session.setLanguage("en-US")
+        _ = session.step(Array(samples[split...]))
+        _ = session.finish()
+        #expect(session.isFinished)
+    }
+
     /// Real-weights streaming smoke over a local pinned checkpoint. No-op unless
     /// MLXAUDIO_NEMOTRON_DIR points at a model directory. Optional:
     /// MLXAUDIO_STREAM_WAV (input clip), MLXAUDIO_STREAM_CHUNK_MS (default 80),
-    /// MLXAUDIO_STREAM_DUMP (writes {text, tokens:[{id,text,start,duration}]} JSON
+    /// MLXAUDIO_STREAM_DUMP (writes {text, tokens:[{id,text,start,duration,logprob,entropy}]} JSON
     /// for offline comparison against the python mlx-audio reference).
     @Test func nemotronRealWeightsStreamSmoke() throws {
         let env = ProcessInfo.processInfo.environment
@@ -3519,7 +3623,14 @@ struct NemotronASRTests {
                 "chunk_ms": chunkMs,
                 "text": session.text,
                 "tokens": collected.map {
-                    ["id": $0.id, "text": $0.text, "start": $0.start, "duration": $0.duration]
+                    [
+                        "id": $0.id,
+                        "text": $0.text,
+                        "start": $0.start,
+                        "duration": $0.duration,
+                        "logprob": $0.logprob,
+                        "entropy": $0.entropy,
+                    ]
                 },
             ]
             let data = try JSONSerialization.data(

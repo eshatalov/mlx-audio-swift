@@ -62,7 +62,13 @@ extension NemotronASRModel {
                 cell: decoderOutput.1.cell?.asType(frame.dtype)
             )
             let jointOutput = joint(frame, pred)
-            let token = jointOutput.argMax(axis: -1).item(Int.self)
+            let logits = jointOutput.asType(.float32)
+            let logProbs = logits - logits.logSumExp(axis: -1, keepDims: true)
+            let tokenArray = jointOutput.argMax(axis: -1, keepDims: true)
+            let tokenLogprob = takeAlong(logProbs, tokenArray, axis: -1)
+            let entropy = -(exp(logProbs) * logProbs).sum(axis: -1)
+            eval(tokenArray, tokenLogprob, entropy)
+            let token = tokenArray.item(Int.self)
             let step = NemoDecodingLogic.rnntStep(
                 predictedToken: token,
                 blankToken: blankTokenID,
@@ -79,7 +85,9 @@ extension NemotronASRModel {
                             id: token,
                             text: NemotronASRTokenizer.decode(tokens: [token], vocabulary: vocabulary),
                             start: Double(state.globalTime + time) * frameSeconds,
-                            duration: frameSeconds
+                            duration: frameSeconds,
+                            logprob: tokenLogprob.item(Float.self),
+                            entropy: entropy.item(Float.self)
                         )
                     )
                 }
@@ -104,7 +112,7 @@ public final class NemotronASRStreamSession {
     }
 
     private let model: NemotronASRModel
-    private let language: String?
+    public private(set) var language: String?
     private let chunkFrames: Int?
     private let frameSeconds: Double
 
@@ -144,6 +152,13 @@ public final class NemotronASRStreamSession {
     public var tokens: [Int] { rnntState.results.map { $0.id } }
     /// Whether `finish()` has been called.
     public var isFinished: Bool { done }
+
+    /// Change the language prompt for the next processed encoder chunk (`chunkMs`
+    /// granularity). Encoder caches and the decoder LSTM state are preserved. This
+    /// has only been measured at 80 ms latency; `nil` selects the model default.
+    public func setLanguage(_ language: String?) {
+        self.language = language
+    }
 
     /// Ingest a chunk of 16 kHz mono samples; returns the text decoded by this call.
     @discardableResult

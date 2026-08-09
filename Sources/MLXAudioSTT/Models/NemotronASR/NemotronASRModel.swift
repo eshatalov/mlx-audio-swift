@@ -222,8 +222,13 @@ public final class NemotronASRModel: Module, STTGenerationModel {
             )
 
             let jointOutput = joint(frame, pred)
-            eval(jointOutput)
-            let token = jointOutput.argMax(axis: -1).item(Int.self)
+            let logits = jointOutput.asType(.float32)
+            let logProbs = logits - logits.logSumExp(axis: -1, keepDims: true)
+            let tokenArray = jointOutput.argMax(axis: -1, keepDims: true)
+            let tokenLogprob = takeAlong(logProbs, tokenArray, axis: -1)
+            let entropy = -(exp(logProbs) * logProbs).sum(axis: -1)
+            eval(jointOutput, tokenArray, tokenLogprob, entropy)
+            let token = tokenArray.item(Int.self)
             let step = NemoDecodingLogic.rnntStep(
                 predictedToken: token,
                 blankToken: blankTokenID,
@@ -241,7 +246,9 @@ public final class NemotronASRModel: Module, STTGenerationModel {
                             id: token,
                             text: NemotronASRTokenizer.decode(tokens: [token], vocabulary: vocabulary),
                             start: Double(time) * frameSeconds,
-                            duration: frameSeconds
+                            duration: frameSeconds,
+                            logprob: tokenLogprob.item(Float.self),
+                            entropy: entropy.item(Float.self)
                         )
                     )
                 }
