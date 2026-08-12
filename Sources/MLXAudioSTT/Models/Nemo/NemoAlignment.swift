@@ -5,12 +5,23 @@ public struct NemoAlignedToken: Sendable {
     public let text: String
     public var start: Double
     public var duration: Double
+    public let logprob: Float
+    public let entropy: Float
 
-    public init(id: Int, text: String, start: Double, duration: Double) {
+    public init(
+        id: Int,
+        text: String,
+        start: Double,
+        duration: Double,
+        logprob: Float = 0,
+        entropy: Float = 0
+    ) {
         self.id = id
         self.text = text
         self.start = start
         self.duration = duration
+        self.logprob = logprob
+        self.entropy = entropy
     }
 
     public var end: Double {
